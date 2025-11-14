@@ -1,146 +1,406 @@
 import telebot
-import json
 import os
+import sqlite3
 from dotenv import load_dotenv
+from datetime import datetime
+from telebot import types
+
+
 load_dotenv()
-BOT_TOKEN = os.getenv('BOT_TOKEN')
+API_TOKEN = os.getenv('BOT_TOKEN')
+
+ALLOWED_USER_IDS = ['x1','x2']
+PROXY = None 
+
+user_states = {}
+DATABASE_NAME = 'task_manager.db'
+
+if PROXY:
+    telebot.apihelper.proxy = {'https': PROXY}
+    print("Proxy set up.")
+
+bot = telebot.TeleBot(API_TOKEN)
 
 
-telebot.apihelper.proxy = {
-    'https': 'socks5h://127.0.0.1:10808'
-}
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-BOT_USERNAME = bot.get_me().username.lower()
-
-TASKS_FILE = "tasks.json"
-
-def load_tasks():
-    if os.path.exists(TASKS_FILE):
-        with open(TASKS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-def save_tasks(tasks):
-    with open(TASKS_FILE, "w", encoding="utf-8") as f:
-        json.dump(tasks, f, ensure_ascii=False, indent=2)
-
-tasks = load_tasks()
-user_state = {}
-WAITING_FOR_DESCRIPTION = "waiting_for_description"
-WAITING_FOR_DATE = "waiting_for_date"
+def init_db():
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            description TEXT NOT NULL,
+            assigned_to TEXT,
+            due_date TEXT,
+            creator_id INTEGER,
+            is_completed INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
+    conn.close()
+    print("Database initialized.")
 
 
-def is_mentioned_or_private(message):
-    if message.chat.type == "private":
-        return True
-    if message.chat.type in ['group', 'supergroup']:
-        text = (message.text or "").lower()
-        return f"@{BOT_USERNAME}" in text
-    return False
+def db_query(query, params=(), fetch_one=False, commit=False):
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(query, params)
 
-@bot.message_handler(commands=['start', 'add', 'history', 'delete'])
-def handle_commands(message):
-    if not is_mentioned_or_private(message):
+        if commit:
+            conn.commit()
+            conn.close()
+            return None
+
+        result = cursor.fetchone() if fetch_one else cursor.fetchall()
+        return result
+    except Exception as e:
+        print(f"Database Error: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+
+def authorized_only(func):
+
+    def wrapper(message):
+        if message.from_user.id not in ALLOWED_USER_IDS:
+            # فقط در چت‌های خصوصی پیام عدم دسترسی ارسال شود.
+            if message.chat.type == 'private':
+                bot.send_message(
+                    message.chat.id,
+                    "⛔️ **شما مجاز به استفاده از این ربات نیستید.**",
+                    parse_mode="Markdown"
+                )
+            return
+        return func(message)
+
+    return wrapper
+
+
+def get_main_menu():
+    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    item_add = types.KeyboardButton("➕ افزودن (Add)")
+    item_delete = types.KeyboardButton("❌ حذف (Delete)")
+    item_update = types.KeyboardButton("✍️ به‌روزرسانی (Update)")
+    item_history = types.KeyboardButton("📜 تاریخچه (History)")
+    markup.add(item_add, item_delete, item_update, item_history)
+    return markup
+
+
+@bot.message_handler(commands=['start'])
+@authorized_only
+def send_welcome(message):
+    greeting = "Hello mabno, I'm task manager bot. What can I do for you?"
+    bot.send_message(
+        message.chat.id,
+        greeting,
+        reply_markup=get_main_menu()
+    )
+
+
+STATE_ADD_DESCRIPTION = 1
+STATE_ADD_PERSON = 2
+STATE_ADD_DATE = 3
+
+
+@bot.message_handler(func=lambda message: message.text in ["➕ افزودن (Add)", "Add"])
+@authorized_only
+def start_add_task(message):
+    user_states[message.from_user.id] = {'step': STATE_ADD_DESCRIPTION, 'data': {}}
+    msg = bot.send_message(
+        message.chat.id,
+        "Please enter the **description** of the task.",
+        parse_mode="Markdown"
+    )
+    bot.register_next_step_handler(msg, get_task_description)
+
+
+def get_task_description(message):
+    user_id = message.from_user.id
+    if message.text in ["➕ افزودن (Add)", "❌ حذف (Delete)", "✍️ به‌روزرسانی (Update)", "📜 تاریخچه (History)"]:
+        bot.send_message(message.chat.id, "عملیات فعلی لغو شد. لطفا دوباره شروع کنید.")
+        del user_states[user_id]
         return
 
-    command = message.text.split()[0].lower().lstrip('/').split('@')[0]
+    user_states[user_id]['data']['description'] = message.text
+    user_states[user_id]['step'] = STATE_ADD_PERSON
 
-    if command == 'start':
-        bot.reply_to(message, (
-            "سلام مبنو 😄\n"
-            "دستورات من:\n"
-            "/add ➕ افزودن تسک جدید\n"
-            "/history 📋 مشاهده تسک‌ها\n"
-            "/delete ❌ حذف تسک"
-        ))
+    msg = bot.send_message(message.chat.id, "Who is the task **assigned to**?", parse_mode="Markdown")
+    bot.register_next_step_handler(msg, get_task_person)
 
-    elif command == 'add':
-        chat_id = str(message.chat.id)
-        user_state[chat_id] = WAITING_FOR_DESCRIPTION
-        bot.reply_to(message, "لطفاً توضیح تسک را بنویس:")
 
-    elif command == 'history':
-        chat_id = str(message.chat.id)
-        if chat_id not in tasks or not tasks[chat_id]:
-            bot.reply_to(message, "هیچ تسکی ثبت نشده.")
-            return
-        text = "لیست تسک‌ها:\n\n"
-        for i, t in enumerate(tasks[chat_id], 1):
-            text += f"{i}. {t['description']} — {t['date']}\n"
-        bot.reply_to(message, text)
-
-    elif command == 'delete':
-        chat_id = str(message.chat.id)
-        parts = message.text.split(maxsplit=1)
-        if len(parts) < 2:
-            bot.reply_to(message, "برای حذف بنویس:\n/delete <متن>")
-            return
-        query = parts[1].strip()
-        if chat_id not in tasks or not tasks[chat_id]:
-            bot.reply_to(message, "هیچ تسکی برای حذف نیست.")
-            return
-        removed = [t for t in tasks[chat_id] if query in t['description'] or query in t['date']]
-        if not removed:
-            bot.reply_to(message, "تسکی پیدا نشد.")
-            return
-        tasks[chat_id] = [t for t in tasks[chat_id] if t not in removed]
-        save_tasks(tasks)
-        removed_text = "\n".join([f"{t['description']} — {t['date']}" for t in removed])
-        bot.reply_to(message, f"تسک(های) زیر حذف شد:\n\n{removed_text}")
-
-@bot.message_handler(func=lambda m: user_state.get(str(m.chat.id)) == WAITING_FOR_DESCRIPTION)
-def get_description(message):
-    if not is_mentioned_or_private(message):
+def get_task_person(message):
+    user_id = message.from_user.id
+    if message.text in ["➕ افزودن (Add)", "❌ حذف (Delete)", "✍️ به‌روزرسانی (Update)", "📜 تاریخچه (History)"]:
+        bot.send_message(message.chat.id, "عملیات فعلی لغو شد. لطفا دوباره شروع کنید.")
+        del user_states[user_id]
         return
-    chat_id = str(message.chat.id)
-    user_state[chat_id] = WAITING_FOR_DATE
-    user_state[f"{chat_id}_desc"] = message.text
-    bot.reply_to(message, "حالا تاریخ ددلاین را بنویس (مثلاً ۱۴۰۴/۱۱/۱۵):")
+
+    user_states[user_id]['data']['assigned_to'] = message.text
+    user_states[user_id]['step'] = STATE_ADD_DATE
+
+    msg = bot.send_message(message.chat.id, "What is the **due date**? (Format: YYYY-MM-DD)", parse_mode="Markdown")
+    bot.register_next_step_handler(msg, save_task)
 
 
+def save_task(message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
 
-@bot.message_handler(func=lambda m: user_state.get(str(m.chat.id)) == WAITING_FOR_DATE)
-def get_date(message):
-    if not is_mentioned_or_private(message):
+    if message.text in ["➕ افزودن (Add)", "❌ حذف (Delete)", "✍️ به‌روزرسانی (Update)", "📜 تاریخچه (History)"]:
+        bot.send_message(message.chat.id, "عملیات فعلی لغو شد. لطفا دوباره شروع کنید.")
+        del user_states[user_id]
         return
-    chat_id = str(message.chat.id)
-    desc = user_state.get(f"{chat_id}_desc", "بدون توضیح")
-    date = message.text
-    if chat_id not in tasks:
-        tasks[chat_id] = []
-    tasks[chat_id].append({"description": desc, "date": date})
-    save_tasks(tasks)
-    bot.reply_to(message, f"تسک اضافه شد!\n\n<b>{desc}</b>\n<b>{date}</b>")
-    user_state.pop(chat_id, None)
-    user_state.pop(f"{chat_id}_desc", None)
+
+    due_date_str = message.text.strip()
+
+    try:
+        datetime.strptime(due_date_str, '%Y-%m-%d')
+    except ValueError:
+        msg = bot.send_message(
+            chat_id,
+            "⚠️ **فرمت تاریخ نامعتبر است.** لطفا تاریخ را با فرمت **YYYY-MM-DD** مجدداً ارسال کنید."
+        )
+        return bot.register_next_step_handler(msg, save_task)
+
+    data = user_states[user_id]['data']
+    description = data['description']
+    assigned_to = data['assigned_to']
+
+    db_query(
+        "INSERT INTO tasks (description, assigned_to, due_date, creator_id) VALUES (?, ?, ?, ?)",
+        (description, assigned_to, due_date_str, user_id),
+        commit=True
+    )
+
+    bot.send_message(
+        chat_id,
+        "✅ **وظیفه با موفقیت اضافه شد!**\n\n**توضیحات:** {}\n**مسئول:** {}\n**تاریخ سررسید:** {}".format(
+            description, assigned_to, due_date_str
+        ),
+        parse_mode="Markdown",
+        reply_markup=get_main_menu()
+    )
+    del user_states[user_id]
 
 
-@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'] and
-                    f"@{BOT_USERNAME}" in (m.text or "").lower() and
-                    not m.text.strip().startswith('/'))
-def handle_mention_only(message):
-    bot.reply_to(message, (
-        "سلام! من ربات مدیریت تسک هستم\n"
-        "برای استفاده در گروه، دستورات رو با منشن بزن:\n\n"
-        f"• <code>@{bot.get_me().username} /add</code> ➕ افزودن تسک\n"
-        f"• <code>@{bot.get_me().username} /history</code> 📋 لیست تسک‌ها\n"
-        f"• <code>@{bot.get_me().username} /delete متن</code> ❌ حذف تسک\n\n"
-        "یا در چت خصوصی بدون منشن استفاده کن."
-    ), parse_mode="HTML")
+
+@bot.message_handler(func=lambda message: message.text in ["❌ حذف (Delete)", "Delete"])
+@authorized_only
+def start_delete_task(message):
+    msg = bot.send_message(
+        message.chat.id,
+        "Please enter a few **keywords** from the task description to search for the task.",
+        parse_mode="Markdown"
+    )
+    bot.register_next_step_handler(msg, search_and_delete_task)
 
 
+def search_and_delete_task(message):
+    chat_id = message.chat.id
+    keywords = message.text
 
-@bot.message_handler(func=lambda m: m.chat.type == "private")
-def private_fallback(message):
-    if message.text.startswith('/'):
+    tasks = db_query(
+        "SELECT id, description, due_date FROM tasks WHERE description LIKE ? AND is_completed = 0 ORDER BY due_date",
+        (f"%{keywords}%",)
+    )
+
+    if not tasks:
+        bot.send_message(chat_id, "🔍 **هیچ وظیفه ناتمامی با این کلمات کلیدی پیدا نشد.**", parse_mode="Markdown")
         return
-    bot.reply_to(message, "برای شروع از /add استفاده کن")
+
+    markup = types.InlineKeyboardMarkup()
+    response_text = "🗑️ **وظیفه مورد نظر برای حذف را انتخاب کنید:**\n\n"
+
+    for task_id, desc, date in tasks:
+        callback_data = f'delete_{task_id}'
+        button_text = f"❌ {desc[:30]}... (تا {date})"
+        markup.add(types.InlineKeyboardButton(button_text, callback_data=callback_data))
+
+    bot.send_message(chat_id, response_text, reply_markup=markup, parse_mode="Markdown")
 
 
-try:
-    bot.infinity_polling(none_stop=True, interval=0, timeout=20)
-except Exception as e:
-    print(f"خطا: {e}")
-    import time
-    time.sleep(5)
+@bot.callback_query_handler(func=lambda call: call.data.startswith('delete_'))
+def callback_delete_task(call):
+    try:
+        task_id = int(call.data.split('_')[1])
+    except:
+        bot.answer_callback_query(call.id, "خطا در پردازش شناسه وظیفه.")
+        return
+
+    db_query("DELETE FROM tasks WHERE id = ?", (task_id,), commit=True)
+
+    bot.edit_message_text(
+        "✅ **وظیفه با موفقیت حذف شد!** (ID: {})".format(task_id),
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown"
+    )
+    bot.answer_callback_query(call.id, "وظیفه حذف شد.")
+
+
+STATE_UPDATE_NEW_DESCRIPTION = 5
+
+
+@bot.message_handler(func=lambda message: message.text in ["✍️ به‌روزرسانی (Update)", "Update"])
+@authorized_only
+def start_update_task(message):
+    msg = bot.send_message(
+        message.chat.id,
+        "Please enter some words of the description for **searching and updating**.",
+        parse_mode="Markdown"
+    )
+    bot.register_next_step_handler(msg, search_and_select_update)
+
+
+def search_and_select_update(message):
+    chat_id = message.chat.id
+    keywords = message.text
+
+    tasks = db_query(
+        "SELECT id, description, due_date FROM tasks WHERE description LIKE ? ORDER BY due_date",
+        (f"%{keywords}%",)
+    )
+
+    if not tasks:
+        bot.send_message(chat_id, "🔍 **هیچ وظیفه‌ای با این کلمات کلیدی پیدا نشد.**", parse_mode="Markdown")
+        return
+
+    markup = types.InlineKeyboardMarkup()
+    response_text = "🔄 **وظیفه مورد نظر برای به‌روزرسانی را انتخاب کنید:**\n\n"
+
+    for task_id, desc, date in tasks:
+        callback_data = f'update_{task_id}'
+        button_text = f"✍️ {desc[:30]}... (تا {date})"
+        markup.add(types.InlineKeyboardButton(button_text, callback_data=callback_data))
+
+    bot.send_message(chat_id, response_text, reply_markup=markup, parse_mode="Markdown")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('update_'))
+def callback_start_update(call):
+    chat_id = call.message.chat.id
+    user_id = call.from_user.id
+
+    try:
+        task_id = int(call.data.split('_')[1])
+        user_states[user_id] = {'step': STATE_UPDATE_NEW_DESCRIPTION, 'task_id': task_id}
+    except:
+        bot.answer_callback_query(call.id, "خطا در پردازش شناسه وظیفه.")
+        return
+
+    bot.edit_message_text(
+        f"⏳ **وظیفه انتخاب شد.** (ID: {task_id})\n\n**لطفاً توضیحات جدید را وارد یا Paste کنید.** (فیلدهای دیگر ثابت می‌مانند.)",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown"
+    )
+
+    bot.register_next_step_handler(call.message, final_update_task)
+
+    bot.answer_callback_query(call.id, "وظیفه برای به‌روزرسانی انتخاب شد.")
+
+
+def final_update_task(message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+
+    if user_id not in user_states or user_states[user_id]['step'] != STATE_UPDATE_NEW_DESCRIPTION:
+        return
+
+    task_id = user_states[user_id]['task_id']
+    new_description = message.text
+
+    db_query(
+        "UPDATE tasks SET description = ? WHERE id = ?",
+        (new_description, task_id),
+        commit=True
+    )
+
+    bot.send_message(
+        chat_id,
+        "✅ **توضیحات وظیفه با موفقیت به‌روزرسانی شد!**\n\n**ID:** {}\n**توضیحات جدید:** {}".format(
+            task_id, new_description
+        ),
+        parse_mode="Markdown",
+        reply_markup=get_main_menu()
+    )
+
+    del user_states[user_id]
+
+
+
+@bot.message_handler(func=lambda message: message.text in ["📜 تاریخچه (History)", "History"])
+@authorized_only
+def show_history(message):
+    """نمایش کامل تاریخچه وظایف."""
+    tasks = db_query(
+        "SELECT id, description, assigned_to, due_date, is_completed FROM tasks ORDER BY id DESC"
+    )
+
+    if not tasks:
+        bot.send_message(message.chat.id, "📚 **تاریخچه وظایف شما خالی است.**")
+        return
+
+    history_text = "📜 **تاریخچه کامل وظایف:**\n\n"
+
+    for task_id, desc, assigned, date, completed in tasks:
+        status = "✅ انجام‌شده" if completed else "⏳ ناتمام"
+        entry = (
+            f"**ID:** `{task_id}`\n"
+            f"**وضعیت:** {status}\n"
+            f"**توضیحات:** {desc}\n"
+            f"**مسئول:** {assigned}\n"
+            f"**سررسید:** {date}\n"
+            f"------\n"
+        )
+
+        # مدیریت محدودیت طول پیام تلگرام
+        if len(history_text) + len(entry) > 4000:
+            bot.send_message(message.chat.id, history_text, parse_mode="Markdown")
+            history_text = entry
+        else:
+            history_text += entry
+
+    if history_text:
+        bot.send_message(message.chat.id, history_text, parse_mode="Markdown")
+
+
+@bot.message_handler(content_types=['text'], func=lambda message: message.chat.type in ['group',
+                                                                                        'supergroup'] and f'@{bot.get_me().username}' in message.text)
+@authorized_only
+def handle_group_mentions(message):
+    bot_username = bot.get_me().username
+    try:
+        text_after_mention = message.text.split(f'@{bot_username}', 1)[1].strip()
+    except IndexError:
+        text_after_mention = ""
+
+    command_map = {
+        "add": start_add_task, "افزودن": start_add_task,
+        "delete": start_delete_task, "حذف": start_delete_task,
+        "update": start_update_task, "به‌روزرسانی": start_update_task,
+        "history": show_history, "تاریخچه": show_history,
+    }
+
+    if not text_after_mention or any(cmd in text_after_mention.lower() for cmd in ["دستورات", "سلام", "شروع"]):
+        greeting = "Hello mabno, I'm task manager bot. What can I do for you? \n\n**Commands:** Add, Delete, Update, History"
+        bot.send_message(message.chat.id, greeting, parse_mode="Markdown")
+        return
+
+    for cmd_key, handler in command_map.items():
+        if text_after_mention.lower().startswith(cmd_key):
+            message.text = cmd_key
+            handler(message)
+            return
+
+if __name__ == '__main__':
+    init_db()
+    print("Bot is starting...")
+    try:
+        bot.infinity_polling()
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
